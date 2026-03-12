@@ -51,7 +51,8 @@ with chat_container:
         if message["role"] == "user":
             st.markdown(f"**You:** {message['content']}")
         else:
-            st.markdown(f"**Bot:** {message['content']}")
+            st.markdown("**Bot:**")
+            st.text(message["content"].replace("  \n", "\n"))
             # sources and metrics intentionally omitted for clean display
 
 

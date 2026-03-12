@@ -17,17 +17,34 @@ from langchain_community.document_loaders import (
 )
 from langchain_core.documents import Document
 
-def load_html(url):
-    r = requests.get(url)
-    soup = BeautifulSoup(r.text, "html.parser")
+def _is_local_path(source):
+    return isinstance(source, str) and os.path.exists(source)
+
+
+def load_html(source):
+    if _is_local_path(source):
+        with open(source, "r", encoding="utf-8", errors="ignore") as f:
+            html = f.read()
+        source_url = source
+    else:
+        r = requests.get(source, timeout=15)
+        r.raise_for_status()
+        html = r.text
+        source_url = source
+
+    soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(separator=" ")
 
-    return [Document(page_content=text, metadata={"source_url": url})]
+    return [Document(page_content=text, metadata={"source_url": source_url})]
 
 
-def load_pdf(url):
+def load_pdf(source):
+    if _is_local_path(source):
+        loader = PyPDFLoader(source)
+        return loader.load()
+
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, stream=True, timeout=15, allow_redirects=True, headers=headers)
+    r = requests.get(source, stream=True, timeout=15, allow_redirects=True, headers=headers)
     if r.status_code != 200:
         raise ValueError(f"HTTP {r.status_code}")
 
@@ -77,34 +94,46 @@ def load_pdf(url):
     return loader.load()
 
 
-def load_xlsx(url):
+def load_xlsx(source):
+    if _is_local_path(source):
+        loader = UnstructuredExcelLoader(source)
+        return loader.load()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        tmp.write(requests.get(url).content)
+        tmp.write(requests.get(source, timeout=15).content)
         loader = UnstructuredExcelLoader(tmp.name)
         return loader.load()
 
 
-def load_csv(url):
+def load_csv(source):
+    if _is_local_path(source):
+        loader = CSVLoader(source)
+        return loader.load()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-        tmp.write(requests.get(url).content)
+        tmp.write(requests.get(source, timeout=15).content)
         loader = CSVLoader(tmp.name)
         return loader.load()
 
 
-def load_txt(url):
+def load_txt(source):
+    if _is_local_path(source):
+        loader = TextLoader(source)
+        return loader.load()
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-        tmp.write(requests.get(url).content)
+        tmp.write(requests.get(source, timeout=15).content)
         loader = TextLoader(tmp.name)
         return loader.load()
 
 
-def route_loader(url, file_type):
+def route_loader(source, file_type):
     if file_type == "pdf":
-        return load_pdf(url)
-    if file_type == "xlsx":
-        return load_xlsx(url)
+        return load_pdf(source)
+    if file_type in ("xlsx", "xls"):
+        return load_xlsx(source)
     if file_type == "csv":
-        return load_csv(url)
+        return load_csv(source)
     if file_type == "txt":
-        return load_txt(url)
-    return load_html(url)
+        return load_txt(source)
+    return load_html(source)

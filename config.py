@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load environment files from both project root and data folder.
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / "data" / ".env")
 
 BASE_URL = "https://ycce.edu/"
 DOMAIN = "ycce.edu"
@@ -10,7 +14,7 @@ RATE_LIMIT = 1
 
 SIMILARITY_THRESHOLD = 0.35
 
-DATA_DIR = "data"
+DATA_DIR = str(PROJECT_ROOT / "data")
 FAISS_PATH = os.path.join(DATA_DIR, "faiss_index")
 DISCOVERED_URLS = os.path.join(DATA_DIR, "discovered_urls.json")
 REGISTRY_PATH = os.path.join(DATA_DIR, "url_registry.json")

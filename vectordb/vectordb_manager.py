@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import time
+import pickle
 
 # ✅ REDIRECT ALL PATHS TO E DRIVE (C-drive protection)
 os.environ['TEMP'] = r'E:\temp'
@@ -52,6 +54,9 @@ class VectorDBManager:
                     return self.model.encode(texts, show_progress_bar=False, convert_to_numpy=False).tolist()
                 def embed_query(self, text):
                     return self.model.encode([text], show_progress_bar=False, convert_to_numpy=False)[0].tolist()
+                def __call__(self, text):
+                    # Compatibility with call-sites expecting a callable embedding function.
+                    return self.embed_query(text)
             self.embeddings = SimpleWrapper()
         self.db = None
         self._load_db()
@@ -60,12 +65,21 @@ class VectorDBManager:
     # --------------------------------------------------
     def _load_db(self):
         if os.path.exists(self.persist_directory):
-            self.db = FAISS.load_local(
-                self.persist_directory,
-                self.embeddings,
-                allow_dangerous_deserialization=True
-            )
-            print("[OK] FAISS loaded")
+            last_error = None
+            for attempt in range(1, 7):
+                try:
+                    self.db = FAISS.load_local(
+                        self.persist_directory,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True
+                    )
+                    print("[OK] FAISS loaded")
+                    return
+                except (pickle.UnpicklingError, EOFError) as e:
+                    last_error = e
+                    print(f"[WARN] FAISS metadata read interrupted (attempt {attempt}/6), retrying...")
+                    time.sleep(1.0)
+            raise RuntimeError(f"Unable to load FAISS metadata after retries: {last_error}")
         else:
             print("[WARN] No FAISS index found - will create new")
 
@@ -191,9 +205,16 @@ class VectorDBManager:
 # --------------------------------------------------
 # GLOBAL HELPER (used by ingestion)
 # --------------------------------------------------
-_vectordb = VectorDBManager()
+_vectordb = None
+
+
+def _get_vectordb():
+    global _vectordb
+    if _vectordb is None:
+        _vectordb = VectorDBManager()
+    return _vectordb
 
 
 def upsert_documents(documents):
     """Used by ingest pipeline"""
-    _vectordb.add_documents(documents)
+    _get_vectordb().add_documents(documents)

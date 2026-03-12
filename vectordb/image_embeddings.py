@@ -103,6 +103,37 @@ class ImageEmbedder:
                 continue
         
         return None
+
+    def embed_image_from_path(self, image_path: str) -> Optional[List[float]]:
+        """Generate embedding from a local cached image file path."""
+        try:
+            image = Image.open(image_path).convert("RGB")
+
+            with torch.no_grad():
+                inputs = self.processor(images=image, return_tensors="pt")
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                outputs = self.model.get_image_features(**inputs)
+
+                if hasattr(outputs, 'image_embeds'):
+                    embedding_tensor = outputs.image_embeds
+                elif hasattr(outputs, 'last_hidden_state'):
+                    embedding_tensor = outputs.last_hidden_state.mean(dim=1)
+                else:
+                    embedding_tensor = outputs
+
+                if isinstance(embedding_tensor, torch.Tensor):
+                    embedding_np = embedding_tensor.cpu().detach().numpy()
+                else:
+                    embedding_np = embedding_tensor
+
+                if embedding_np.ndim > 1:
+                    embedding_np = embedding_np[0]
+
+                embedding_np = embedding_np / (embedding_np**2).sum()**0.5
+                return embedding_np.tolist()
+        except Exception as e:
+            print(f"[ERROR] Local image embedding failed: {image_path} - {e}")
+            return None
     
     def embed_images_batch(self, urls: List[str], batch_size: int = 32) -> dict:
         """
@@ -161,3 +192,9 @@ def embed_image_from_url(url: str) -> Optional[List[float]]:
     """
     embedder = get_embedder()
     return embedder.embed_image_from_url(url)
+
+
+def embed_image_from_path(image_path: str) -> Optional[List[float]]:
+    """Convenient function to embed a local cached image file."""
+    embedder = get_embedder()
+    return embedder.embed_image_from_path(image_path)

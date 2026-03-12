@@ -26,10 +26,20 @@ class SentenceTransformerWrapper:
         self.model = SentenceTransformer(model_name)
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self.model.encode(texts, show_progress_bar=False, convert_to_numpy=False).tolist()
+        vectors = self.model.encode(texts, show_progress_bar=False, convert_to_numpy=False)
+        if hasattr(vectors, "tolist"):
+            return vectors.tolist()
+        return [list(v) for v in vectors]
 
     def embed_query(self, text: str) -> List[float]:
-        return self.model.encode([text], show_progress_bar=False, convert_to_numpy=False)[0].tolist()
+        vector = self.model.encode([text], show_progress_bar=False, convert_to_numpy=False)[0]
+        if hasattr(vector, "tolist"):
+            return vector.tolist()
+        return list(vector)
+
+    def __call__(self, text: str) -> List[float]:
+        # Compatibility with call-sites expecting a callable embedding function.
+        return self.embed_query(text)
 
 
 if HuggingFaceEmbeddings is not None:

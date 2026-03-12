@@ -51,7 +51,8 @@ if sys.platform == "win32":
 
 from crawler.bfs_crawler import bfs_crawl
 from detector.change_detector import detect_changes
-from ingestion.ingest_pipeline import ingest_items
+from ingestion.ingest_pipeline import ingest_items, get_last_processed_folder, load_ingested_urls
+from ingestion.runtime_input_cache import prepare_runtime_input_cache
 from vectordb.vectordb_manager import VectorDBManager
 from config import BASE_URL
 
@@ -71,14 +72,23 @@ FAISS_PATH = os.path.join(DATA_DIR, "faiss_index")
 # ==================================================
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(PROGRESS_FILE, "r", encoding="utf-8-sig") as f:
+            progress = json.load(f)
+    else:
+        progress = {
+            "crawl_done": False,
+            "change_detection_done": False,
+            "ingestion_done": False
+        }
 
-    return {
-        "crawl_done": False,
-        "change_detection_done": False,
-        "ingestion_done": False
-    }
+    # Derive ingestion completion from explicit folder completion markers.
+    try:
+        remaining_folder = get_last_processed_folder(load_ingested_urls())
+        progress["ingestion_done"] = remaining_folder is None
+    except Exception:
+        progress.setdefault("ingestion_done", False)
+
+    return progress
 
 
 def save_progress(progress):
@@ -119,7 +129,7 @@ def main():
         if os.path.exists(CRAWL_FILE):
             print("[INFO] Existing discovered_urls.json found - skipping crawl")
 
-            with open(CRAWL_FILE, "r", encoding="utf-8") as f:
+            with open(CRAWL_FILE, "r", encoding="utf-8-sig") as f:
                 crawled_items = json.load(f)
 
             progress["crawl_done"] = True
@@ -148,7 +158,7 @@ def main():
         if os.path.exists(REGISTRY_FILE):
             print("[INFO] url_registry.json found - Step 2 already completed")
 
-            with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+            with open(REGISTRY_FILE, "r", encoding="utf-8-sig") as f:
                 registry_data = json.load(f)
 
             print(f"[OK] Registered URLs: {len(registry_data)}")
@@ -183,9 +193,38 @@ def main():
             print("[WARN] Nothing to ingest")
             return
 
+        try:
+            next_folder = get_last_processed_folder(load_ingested_urls())
+            if next_folder is None:
+                print("[INFO] All folders are already marked complete")
+            else:
+                print(f"[INFO] Next ingestion folder: {next_folder}")
+        except Exception as e:
+            print(f"[WARN] Could not determine next ingestion folder: {e}")
+
         if progress["ingestion_done"]:
             print("[INFO] Ingestion already completed - skipping FAISS update")
         else:
+            # -------- PREPARE RUNTIME INPUT CACHE (PARALLEL DOWNLOAD) --------
+            print("\n[INPUT] Building runtime input cache...")
+            runtime_items = changed_items
+            try:
+                runtime_items = prepare_runtime_input_cache(changed_items)
+                ready_items = [
+                    item for item in runtime_items
+                    if isinstance(item, dict) and not item.get("download_failed")
+                ]
+                skipped_failed = [
+                    item for item in runtime_items
+                    if isinstance(item, dict) and item.get("download_failed")
+                ]
+                print(
+                    f"[INPUT] Runtime cache prepared. ready={len(ready_items)} skipped_failed={len(skipped_failed)} total={len(runtime_items)}"
+                )
+            except Exception as e:
+                print(f"[WARN] Runtime input cache failed: {e}")
+                print("[INFO] Falling back to direct URL ingestion")
+
             # -------- CLASSIFY URLs FOR IMAGES & TEXT --------
             print("\n[INFO] Classifying URLs...")
             text_urls = []
@@ -195,7 +234,10 @@ def main():
             # Track already-embedded images to avoid duplicates
             embedded_images = set()
 
-            for item in changed_items:
+            for item in runtime_items:
+                if isinstance(item, dict) and item.get("download_failed"):
+                    continue
+
                 # Handle both string URLs and dict-based URLs
                 url = item if isinstance(item, str) else item.get("url", str(item))
 
@@ -214,62 +256,92 @@ def main():
                     ext = url.lower().split(".")[-1] if "." in url else ""
                     if ext == "pdf":
                         url_type = "pdf"
-                    elif ext in ["xlsx", "xls", "csv"]:
-                        url_type = "excel"
+                    elif ext in ["xlsx", "xls"]:
+                        url_type = "xlsx"
+                    elif ext == "csv":
+                        url_type = "csv"
+                    elif ext == "txt":
+                        url_type = "txt"
                     else:
                         url_type = "html"
                     text_urls.append({"url": url, "type": url_type})
 
-            # -------- TEXT INGESTION (EXISTING LOGIC UNTOUCHED) --------
+            # -------- TEXT INGESTION (FOLDER-ORDERED WITH CHECKPOINT SAFETY) --------
+            ingestion_success = False
             if text_urls:
-                print(f"[INFO] Ingesting {len(text_urls)} text/PDF URLs...")
-                ingest_items(text_urls)
-                print("[OK] Text ingestion completed")
+                print(f"[INFO] Ingesting {len(text_urls)} text/PDF URLs (folder-ordered)...")
+                try:
+                    ingestion_success = ingest_items(text_urls)
+                    if ingestion_success:
+                        print("[OK] ✅ Text ingestion completed successfully - FAISS persisted")
+                    else:
+                        print("[WARN] Text ingestion paused (resumable from checkpoint)")
+                except Exception as e:
+                    print(f"[ERROR] Text ingestion failed: {e}")
+                    ingestion_success = False
             else:
                 print("[WARN] No text URLs to ingest")
+
+            if not ingestion_success:
+                progress["ingestion_done"] = False
+                save_progress(progress)
+                print("[INFO] Text ingestion is not finished yet - skipping image stage and leaving pipeline resumable")
+                return
 
             # -------- IMAGE EMBEDDING INTO FAISS (NEW - NO LOCAL SAVE) --------
             if image_urls:
                 print(f"\n[IMG] Processing {len(image_urls)} image URLs for FAISS...")
                 try:
-                    from vectordb.image_embeddings import embed_image_from_url
+                    from vectordb.image_embeddings import embed_image_from_path, embed_image_from_url
                     
                     embedded_count = 0
-                    skipped_count = 0
                     failed_count = 0
                     
                     # Initialize VectorDB for image embeddings
                     db = VectorDBManager(persist_directory=FAISS_PATH)
                     
-                    for idx, img_url in enumerate(image_urls):
-                        # Embed image (in-memory, NO download)
-                        embedding = embed_image_from_url(img_url)
-                        
-                        if embedding:
-                            # Upsert to FAISS with metadata
-                            metadata = {
-                                "source_url": img_url,
-                                "content_type": "image"
-                            }
-                            db.upsert_image_embedding(embedding, metadata)
-                            media_records.append(metadata)
-                            embedded_count += 1
-                        else:
+                    for idx, image_item in enumerate(image_urls):
+                        img_url = image_item if isinstance(image_item, str) else image_item.get("url", "")
+                        local_path = image_item.get("local_path") if isinstance(image_item, dict) else None
+
+                        # Prefer local cached file to avoid runtime re-download.
+                        try:
+                            if local_path and os.path.exists(local_path):
+                                embedding = embed_image_from_path(local_path)
+                            else:
+                                embedding = embed_image_from_url(img_url)
+                            
+                            if embedding:
+                                # Upsert to FAISS with metadata
+                                metadata = {
+                                    "source_url": img_url,
+                                    "content_type": "image"
+                                }
+                                if local_path:
+                                    metadata["local_path"] = local_path
+                                db.upsert_image_embedding(embedding, metadata)
+                                media_records.append(metadata)
+                                embedded_count += 1
+                            else:
+                                failed_count += 1
+                        except Exception as item_err:
+                            print(f"    [WARN] Image {idx+1} skipped: {item_err}")
                             failed_count += 1
                         
                         # Progress logging
                         if (idx + 1) % max(10, len(image_urls) // 5) == 0:
                             print(f"  [IMG] {idx + 1}/{len(image_urls)} processed")
                     
-                    print(f"\n[IMG] Embedded: {embedded_count}")
-                    print(f"[IMG] Failed: {failed_count}")
+                    print(f"\n[IMG] Embedded: {embedded_count} | Failed: {failed_count}")
+                    
+                    # Persist image embeddings to FAISS
+                    if embedded_count > 0:
+                        db.persist()
+                        print("[IMG] ✅ Image embeddings persisted to FAISS")
                     
                 except Exception as e:
                     print(f"[ERROR] Image embedding failed: {e}")
-                    print("[INFO] Continuing with text-only FAISS...")
-            else:
-                print("[WARN] No image URLs found")
-                db = VectorDBManager(persist_directory=FAISS_PATH)
+                    print("[INFO] Continuing with existing FAISS index...")
 
             # -------- CREATE MEDIA REGISTRY (URL ONLY, NO LOCAL PATHS) --------
             if media_records:
@@ -278,15 +350,7 @@ def main():
                     json.dump(media_records, f, indent=2)
                 print(f"[REGISTRY] Saved {len(media_records)} media URLs to media_registry.json")
 
-            # -------- FINAL FAISS PERSIST --------
-            print("\n[INFO] Final FAISS persistence...")
-            try:
-                db.persist()
-                print("[OK] FAISS index persisted to disk")
-            except Exception as e:
-                print(f"[ERROR] FAISS persist failed: {e}")
-
-            progress["ingestion_done"] = True
+            progress["ingestion_done"] = bool(ingestion_success)
             save_progress(progress)
 
     except Exception as e:

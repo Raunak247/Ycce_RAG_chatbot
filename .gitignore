@@ -14,6 +14,14 @@ vectordb/chroma_db/
 *.pkl
 *.sqlite3
 
+# Runtime pipeline artifacts (generated)
+data/input/
+data/media_registry.json
+data/discovered_urls.json
+data/url_registry.json
+data/ingested_urls.json
+data/pipeline_progress.json
+
 # Logs
 *.log
 
