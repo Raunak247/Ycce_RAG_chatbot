@@ -19003,8 +19003,57 @@
   {
     "url": "https://ycce.edu/academic-council/#Content-eca51bf6999e8a483af0",
     "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:21:31Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-914d59b6999e8a483af0",
+    "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:21:45Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-6f78dee6999e8a483af0",
+    "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:22:02Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-fdd544f6999e8a7161ef",
+    "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:22:25Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-d8c309f6999e8a7161ef",
+    "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:22:41Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-aebdaab6999e8a7161ef",
+    "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:22:56Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-eca51bf6999e8a7161ef",
+    "folder": "html",
+    "status": "ingested",
+    "chunks": 50,
+    "timestamp": "2026-03-12T07:23:12Z"
+  },
+  {
+    "url": "https://ycce.edu/academic-council/#Content-914d59b6999e8a7161ef",
+    "folder": "html",
     "status": "parsed",
     "chunks": 50,
-    "timestamp": "2026-03-12T07:21:19Z"
+    "timestamp": "2026-03-12T07:23:13Z"
   }
 ]
