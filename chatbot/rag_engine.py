@@ -140,7 +140,7 @@ Answer:"""
             return "Return concise bullet points with one fact per bullet."
         if style == "role-fact":
             return "Return the exact name and role in first line, then one short supporting line."
-        return "Return one direct concise answer sentence first, then optional 1-2 short bullets."
+        return "Return a clear descriptive paragraph (3-6 sentences) in natural conversational style using only context facts."
 
     def _filetype_priority(self, query: str, intent: dict) -> list:
         explicit = intent.get("explicit_type", "")
@@ -229,10 +229,24 @@ Answer:"""
         # Remove mechanical lead-ins.
         text = re.sub(r"(?im)^here\s+are\s+the\s+relevant\s+people\s+found\s*:\s*", "", text).strip()
         text = re.sub(r"(?im)^here\s+are\s+the\s+syllabus\s+details\s+found\s+in\s+the\s+indexed\s+documents\s*:\s*", "", text).strip()
+        text = re.sub(r"\s*\[S\d+\]", "", text)
+        text = re.sub(r"\s{2,}", " ", text)
 
         # Normalize spacing.
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         return text
+
+    def _append_reference_links(self, answer: str, retrieved_docs: list, query: str, max_links: int = 2) -> str:
+        text = (answer or "").strip()
+        if not text:
+            return text
+        links = self._collect_sources(retrieved_docs, query=query, max_sources=max_links + 2)
+        links = [u for u in links if str(u).lower().startswith("http")]
+        if not links:
+            return text
+        # Keep concise references only; avoid noisy debug sections.
+        refs = links[:max_links]
+        return text + "\n\nReferences:\n" + "\n".join(f"- {u}" for u in refs)
 
     def _is_instructional_noise(self, text: str) -> bool:
         t = (text or "").lower()
@@ -529,6 +543,74 @@ Answer:"""
         matches.sort(key=lambda x: x.get("score", 9.9))
         return matches[:limit]
 
+    def _scan_objective_docs(self, query: str, limit: int = 36) -> list:
+        q = self._preprocess_query(query)
+        objective_intent = any(tok in q for tok in [
+            "program educational objective",
+            "program educational objectives",
+            "peo",
+            "po",
+            "pso",
+            "course outcome",
+            "course outcomes",
+        ])
+        if not objective_intent:
+            return []
+
+        dept_slug = self._extract_department_slug(query)
+        dept_hint = self._extract_department_hint(query)
+        dept_tokens = [t for t in self._tokenize(dept_hint) if len(t) > 2]
+        q_tokens = self._tokenize(query)
+        requires_numbered_peo = any(tok in q for tok in ["program educational objective", "program educational objectives", "peo"])
+
+        matches = []
+        for doc in self._get_docstore_dict().values():
+            meta = getattr(doc, "metadata", {}) or {}
+            content = self._sanitize_context_chunk(getattr(doc, "page_content", "") or "")
+            if not content:
+                continue
+            low = content.lower()
+            if not any(k in low for k in ["program educational objective", "programme educational objective", " peo", "course outcome", " pso", " po-"]):
+                continue
+
+            if any(noise in low for noise in ["survey", "questionnaire", "donation drive", "lpg"]):
+                continue
+
+            src = self._get_source_url(meta)
+            dept_score = self._department_match_score(low, src, dept_slug, dept_hint)
+            if dept_tokens and dept_score < 0.8:
+                continue
+            if "civil" in dept_tokens:
+                hay = f"{low} {src.lower()}"
+                if "civil" not in hay:
+                    continue
+
+            if requires_numbered_peo and not re.search(r"\bpeo\s*[-:]?\s*\d+", low):
+                if "program educational objective" not in low and "programme educational objective" not in low:
+                    continue
+
+            overlap = len(q_tokens.intersection(self._tokenize(low))) / max(len(q_tokens), 1)
+            signal = overlap + dept_score
+            if re.search(r"\bpeo\s*[-:]?\s*\d+", low):
+                signal += 1.2
+            if signal < 0.3:
+                continue
+
+            adjusted_score = max(0.01, 1.0 / (1.0 + signal))
+            matches.append(
+                {
+                    "content": content,
+                    "score": adjusted_score,
+                    "original_score": adjusted_score,
+                    "metadata": meta,
+                }
+            )
+            if len(matches) >= limit * 3:
+                break
+
+        matches.sort(key=lambda x: x.get("score", 9.9))
+        return matches[:limit]
+
     def _dedupe_docs(self, docs: list) -> list:
         deduped = []
         seen = set()
@@ -648,12 +730,114 @@ Answer:"""
             return ""
         return "Here are the syllabus details found in the indexed documents:\n" + "\n".join(chosen)
 
+    def _extract_structured_objectives_answer(self, query: str, retrieved_docs: list) -> str:
+        q = self._preprocess_query(query)
+        objective_intent = any(tok in q for tok in [
+            "program educational objective",
+            "program educational objectives",
+            "peo",
+            "po",
+            "pso",
+            "course outcome",
+            "course outcomes",
+        ])
+        if not objective_intent:
+            return ""
+
+        dept_slug = self._extract_department_slug(query)
+        dept_hint = self._extract_department_hint(query)
+
+        merged_docs = list(retrieved_docs[:12])
+        merged_docs.extend(self._scan_objective_docs(query, limit=24))
+
+        ranked_docs = []
+        for d in merged_docs:
+            if not isinstance(d, dict):
+                continue
+            meta = d.get("metadata", {}) or {}
+            src = self._get_source_url(meta)
+            content = d.get("content", "") or ""
+            if not content:
+                continue
+            low = content.lower()
+            score = self._token_overlap(query, f"{low} {src}")
+            if "program educational objective" in low or "peo" in low:
+                score += 0.7
+            if dept_slug:
+                score += self._department_match_score(low, src, dept_slug, dept_hint)
+            ranked_docs.append((score, content, src))
+
+        if not ranked_docs:
+            return ""
+
+        ranked_docs.sort(key=lambda x: x[0], reverse=True)
+        objective_keywords = {
+            "prepare", "provide", "inculcate", "students", "engineering", "profession",
+            "research", "foundation", "ethical", "sustainability", "learning", "skills",
+        }
+
+        peo_map = {}
+        fallback_lines = []
+        for _, content, src in ranked_docs[:10]:
+            text = (content or "").replace("\u2022", "\n").replace("•", "\n").replace("", " ")
+            for raw in re.split(r"\n+", text):
+                line = re.sub(r"\s+", " ", raw).strip(" .:-")
+                if len(line) < 25 or len(line) > 320:
+                    continue
+
+                m = re.search(r"\bPEO\s*[-:]?\s*(\d+)\s*[-:–]?\s*(.+)$", line, flags=re.IGNORECASE)
+                if m:
+                    idx = int(m.group(1))
+                    body = m.group(2).strip(" .:-")
+                    if len(body) < 35 or len(body) > 260:
+                        continue
+                    body_low = body.lower()
+                    if not any(k in body_low for k in objective_keywords):
+                        continue
+                    if "to pass the exam" in body_low:
+                        continue
+                    peo_map[idx] = body[0].upper() + body[1:] if body else body
+                    continue
+
+                low = line.lower()
+                if re.match(r"^(to\s+|graduates\s+will|prepare\s+students)", low):
+                    if not any(k in low for k in objective_keywords):
+                        continue
+                    if "to pass the exam" in low:
+                        continue
+                    if dept_slug and self._department_match_score(low, src, dept_slug, dept_hint) < 0.4:
+                        continue
+                    fallback_lines.append(line)
+
+        if len(peo_map) >= 2:
+            ordered = sorted(peo_map.items(), key=lambda x: x[0])
+            lines = [f"PEO {idx}: {txt}" for idx, txt in ordered[:8]]
+            return "Program Educational Objectives:\n" + "\n".join(lines)
+
+        dedup = []
+        seen = set()
+        for s in fallback_lines:
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(s)
+            if len(dedup) >= 6:
+                break
+
+        if len(dedup) >= 2:
+            lines = [f"PEO {i+1}: {txt}" for i, txt in enumerate(dedup)]
+            return "Program Educational Objectives:\n" + "\n".join(lines)
+
+        return ""
+
     def _rerank_docs(self, query: str, docs: list) -> list:
         """General lexical-semantic reranker with quality and diversity bias."""
         q = self._preprocess_query(query)
         wants_link = any(tok in q for tok in ["link", "url", "pdf", "download"])
         wants_tabular = any(tok in q for tok in ["count", "number", "rate", "percentage", "criteria", "eligibility", "table", "placement"])
         wants_person = any(tok in q for tok in ["who is", "hod", "head of department", "principal", "faculty", "professor", "department"])
+        wants_objective = any(tok in q for tok in ["program educational objective", "program educational objectives", "peo", "po", "pso", "course outcome", "course outcomes"])
 
         ranked = []
         for doc in docs:
@@ -677,6 +861,16 @@ Answer:"""
             else:
                 if file_type == "html":
                     adj *= 0.90
+
+            if wants_objective:
+                content_low = content.lower()
+                src_low = source_url.lower()
+                if any(k in content_low for k in ["program educational objective", "programme educational objective", " peo", "course outcome", " pso", " po-"]):
+                    adj *= 0.72
+                if any(k in src_low for k in ["course-outcome", "course%20outcome", "2.6.1", "syllabus", "soe"]):
+                    adj *= 0.82
+                if file_type == "pdf":
+                    adj *= 0.85
 
             if wants_person:
                 if file_type == "html":
@@ -1417,6 +1611,8 @@ Answer:"""
         answer_txt = (out.get("answer") or "").strip().lower()
         if "i don't have this information" in answer_txt:
             generation_pct = (confidence * 0.65 + 0.35) * 100.0
+        elif grounding == 0.0 and citation == 0.0 and alignment == 0.0:
+            generation_pct = confidence * 100.0
         else:
             generation_pct = ((confidence * 0.45) + (grounding * 0.30) + (citation * 0.15) + (alignment * 0.10)) * 100.0
 
@@ -1898,27 +2094,100 @@ Answer:"""
             "evidence_count": len(evidence),
         }
 
+    def _run_objective_pipeline(self, query: str) -> dict | None:
+        objective_docs = self._scan_objective_docs(query, limit=30)
+        if not objective_docs:
+            return None
+
+        objective_docs = self._rerank_docs(query, objective_docs)[:10]
+        if not objective_docs:
+            return None
+
+        context_parts = []
+        for i, d in enumerate(objective_docs, 1):
+            meta = d.get("metadata", {}) if isinstance(d, dict) else {}
+            src = meta.get("source_url") or meta.get("source") or meta.get("local_path") or ""
+            chunk = (d.get("content", "") if isinstance(d, dict) else "")[:1200]
+            context_parts.append(f"[Document {i} | source={src}]\n{chunk}")
+        context = "\n\n---\n\n".join(context_parts)
+
+        style = (
+            "Return a descriptive answer. If Program Educational Objectives exist, "
+            "format exactly as PEO 1:, PEO 2:, ... with one complete sentence per PEO. "
+            "Do not include unsupported departments."
+        )
+
+        provider = "extractive"
+        try:
+            answer_text, provider = self._invoke_generation(context, query, style)
+            answer_text = self._sanitize_answer(answer_text)
+            answer_text = self._chatgpt_refine_answer(answer_text)
+        except Exception:
+            answer_text = self._extractive_fallback_answer(query, objective_docs)
+
+        grounding = self._answer_grounding_score(answer_text, objective_docs)
+        low_conf_markers = [
+            "not explicitly",
+            "can be inferred",
+            "general and commonly",
+            "likely",
+            "might",
+        ]
+
+        def _extractive_objective_lines() -> str:
+            lines = []
+            seen = set()
+            for d in objective_docs:
+                text = (d.get("content", "") if isinstance(d, dict) else "")
+                for raw in re.split(r"\n+|(?<=[.!?])\s+", text):
+                    s = re.sub(r"\s+", " ", raw).strip(" .:-")
+                    if len(s) < 40 or len(s) > 280:
+                        continue
+                    low = s.lower()
+                    if not any(k in low for k in ["peo", "program educational objective", "to prepare", "to provide", "to inculcate"]):
+                        continue
+                    if "to pass the exam" in low:
+                        continue
+                    if any(noise in low for noise in ["survey", "questionnaire", "donation drive", "lpg"]):
+                        continue
+                    if not re.search(r"\b(to prepare|to provide|to inculcate)\b", low):
+                        continue
+                    key = low
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(s)
+                    if len(lines) >= 6:
+                        break
+                if len(lines) >= 6:
+                    break
+            if not lines:
+                return "I don't have this information in my database."
+            out = []
+            for i, s in enumerate(lines, 1):
+                if re.match(r"^peo\s*\d+", s, flags=re.IGNORECASE):
+                    out.append(s)
+                else:
+                    out.append(f"PEO {i}: {s}")
+            return "\n".join(out)
+
+        if grounding < 0.30 or any(marker in answer_text.lower() for marker in low_conf_markers):
+            answer_text = _extractive_objective_lines()
+            grounding = self._answer_grounding_score(answer_text, objective_docs)
+
+        return {
+            "answer": answer_text,
+            "provider": provider,
+            "grounding_score": round(grounding, 3),
+            "evidence_count": len(objective_docs),
+            "docs": objective_docs,
+        }
+
     def _append_sources_to_answer(self, answer: str, retrieved_docs: list, query: str = "") -> str:
-        answer = self._chatgpt_refine_answer(answer)
-
-        if not self.inline_sources:
-            return answer
-
-        evidence_lines = self._build_evidence_lines(query, retrieved_docs, max_items=3)
-        sources = self._collect_sources(retrieved_docs, query=query, max_sources=3)
-
-        sections = []
-        if evidence_lines and "why this answer:" not in answer.lower():
-            sections.append("Why this answer:\n" + "\n".join(evidence_lines))
-
-        if sources and "relevant links:" not in answer.lower():
-            source_lines = "\n".join(f"- {s}" for s in sources)
-            sections.append("Relevant links:\n" + source_lines)
-
-        if not sections:
-            return answer
-
-        return f"{answer}\n\n" + "\n\n".join(sections)
+        # User-facing response should remain clean and descriptive.
+        # Evidence/links are still available from structured API fields.
+        refined = self._chatgpt_refine_answer(answer)
+        return self._append_reference_links(refined, retrieved_docs, query=query, max_links=2)
 
     def _retrieve_context(self, query: str, k: int = 8) -> tuple[str, list]:
         """Generalized retrieval across html/pdf/xlsx using variant fusion + reranking."""
@@ -2023,7 +2292,9 @@ Answer:"""
 
             sorted_docs = list(all_docs.values())
             authority_docs = self._scan_authority_docs(query, limit=max(k * 4, 16))
+            objective_docs = self._scan_objective_docs(query, limit=max(k * 4, 20))
             sorted_docs.extend(authority_docs)
+            sorted_docs.extend(objective_docs)
             sorted_docs = self._dedupe_docs(sorted_docs)
             sorted_docs = self._rerank_docs(query, sorted_docs)
             sorted_docs = self._limit_docs_per_source(sorted_docs, per_source=2)
@@ -2303,6 +2574,50 @@ Answer:"""
                 }
                 self._cache_set(query, result)
                 return result
+
+        objective_answer = self._extract_structured_objectives_answer(query, retrieved_docs)
+        if objective_answer:
+            result = {
+                "answer": self._append_sources_to_answer(objective_answer, retrieved_docs, query=query),
+                "sources": [
+                    {
+                        "content": doc["content"],
+                        "score": f"{doc.get('original_score', doc['score']):.4f}",
+                        "metadata": doc.get("metadata", {}),
+                    }
+                    for doc in retrieved_docs[:5]
+                ],
+                "confidence": 0.9,
+                "docs_count": len(retrieved_docs),
+                "avg_score": avg_score,
+                "retrieval_quality": quality,
+            }
+            self._cache_set(query, result)
+            return result
+
+        objective_pipeline = self._run_objective_pipeline(query)
+        if objective_pipeline is not None:
+            obj_docs = objective_pipeline.get("docs", retrieved_docs)
+            result = {
+                "answer": self._append_sources_to_answer(objective_pipeline.get("answer", ""), obj_docs, query=query),
+                "sources": [
+                    {
+                        "content": doc["content"],
+                        "score": f"{doc.get('original_score', doc['score']):.4f}",
+                        "metadata": doc.get("metadata", {}),
+                    }
+                    for doc in obj_docs[:6]
+                ],
+                "confidence": 0.9,
+                "docs_count": len(obj_docs),
+                "avg_score": avg_score,
+                "grounding_score": objective_pipeline.get("grounding_score", 0.0),
+                "generation_provider": objective_pipeline.get("provider", "unknown"),
+                "evidence_count": objective_pipeline.get("evidence_count", 0),
+                "retrieval_quality": quality,
+            }
+            self._cache_set(query, result)
+            return result
 
         person_answer = self._extract_person_role_answer(query, retrieved_docs)
         if person_answer:
