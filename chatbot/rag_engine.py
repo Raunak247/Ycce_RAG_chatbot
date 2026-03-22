@@ -1,4 +1,5 @@
 import os
+import difflib
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -20,6 +21,8 @@ class SmartRAG:
         self.answer_cache = {}
         self.cache_limit = 300
         self.source_doc_cache = None
+        self._last_retrieved_docs = []
+        self._last_retrieval_quality = None
         self.retrieval_gate = {
             "min_overlap": 0.08,
             "min_semantic": 0.18,
@@ -323,6 +326,21 @@ Answer:"""
             if re.search(r"\bct\b|computer\s+technology", hay):
                 score += 1.0
         return score
+
+    def _role_matches_department(self, role_text: str, dept_slug: str, dept_hint: str) -> bool:
+        if not dept_slug and not dept_hint:
+            return True
+        role_low = (role_text or "").lower()
+        hint_tokens = [t for t in self._tokenize(dept_hint) if len(t) > 2]
+        if dept_slug and dept_slug in role_low:
+            return True
+        if hint_tokens and sum(1 for t in hint_tokens if t in role_low) >= 2:
+            return True
+        if dept_slug == "artificial-intelligence-and-data-science":
+            return bool(re.search(r"\baids\b|artificial\s+intelligence|data\s+science|ai\s*&\s*ds|ai\s*and\s*ds", role_low))
+        if dept_slug == "computer-technology":
+            return bool(re.search(r"computer\s+technology|\bct\b", role_low))
+        return False
 
     def _extract_department_slug(self, query: str) -> str:
         q = self._preprocess_query(query)
@@ -784,6 +802,9 @@ Answer:"""
 
     def _cache_set(self, query: str, payload: dict):
         key = self._normalize_cache_key(query)
+        enriched = self._quality_percentages(payload, self._last_retrieved_docs, self._last_retrieval_quality)
+        payload.clear()
+        payload.update(enriched)
         self.answer_cache[key] = payload
         # Simple FIFO trim (dict insertion-order in py3.7+)
         if len(self.answer_cache) > self.cache_limit:
@@ -909,7 +930,7 @@ Answer:"""
 
     def _extract_person_role_answer(self, query: str, retrieved_docs: list) -> str:
         q = self._preprocess_query(query)
-        asks_person = any(k in q for k in ["who is", "tell me about", "about", "principal", "hod", "coordinator", "chairman", "treasurer", "secretary"])
+        asks_person = any(k in q for k in ["who is", "principal", "hod", "head of department", "coordinator", "chairman", "treasurer", "secretary"])
         if not asks_person:
             return ""
 
@@ -958,6 +979,8 @@ Answer:"""
                         name = re.sub(r"\s+", " ", m.group(1)).strip(" ,.-")
                         role = re.sub(r"\s+", " ", m.group(2)).strip(" ,.-")
                         role = re.sub(r"\s*--.*$", "", role).strip(" ,.-")
+                        if dept_slug and not self._role_matches_department(role, dept_slug, self._extract_department_hint(query)):
+                            continue
                         return f"{name} is {role}."
 
             # Do not mine random PDFs for HoD/principal answers; better explicit unknown than wrong.
@@ -995,6 +1018,8 @@ Answer:"""
                 role = re.sub(r"\s+", " ", m.group(2)).strip(" ,.-")
                 role = re.split(r"\s+(?:warm\s+regards|track\s+id|aqar|criterion|thank\s+you)\b", role, maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,.-")
                 role = re.sub(r"\s*--.*$", "", role).strip(" ,.-")
+                if dept_slug and not self._role_matches_department(role, dept_slug, self._extract_department_hint(query)):
+                    continue
                 if target and target not in name.lower() and target not in role.lower():
                     continue
                 candidates.append((name, role))
@@ -1345,7 +1370,59 @@ Answer:"""
         normalized = normalized.replace("calender", "calendar")
         normalized = normalized.replace("backpaper", "back paper")
         normalized = normalized.replace("reese", "re ese")
+        normalized = normalized.replace("colledge", "college")
+        normalized = normalized.replace("admisson", "admission")
+        normalized = normalized.replace("admisssion", "admission")
+        normalized = normalized.replace("departmant", "department")
+        normalized = normalized.replace("departement", "department")
+        normalized = normalized.replace("syallbus", "syllabus")
+        normalized = normalized.replace("semster", "semester")
+        normalized = normalized.replace("feees", "fees")
+
+        vocab = {
+            "ycce", "nagpur", "department", "admission", "eligibility", "criteria", "fees", "fee",
+            "syllabus", "semester", "faculty", "professor", "principal", "coordinator", "calendar",
+            "grievance", "revaluation", "back", "paper", "hod", "placement", "entrepreneurship",
+            "innovation", "centre", "center", "excellence", "nvidia", "siemens", "aids", "computer",
+            "technology", "mechanical", "electronics", "civil", "electrical", "information",
+        }
+        corrected_tokens = []
+        for tok in normalized.split():
+            if len(tok) < 4 or tok in vocab or tok.isdigit():
+                corrected_tokens.append(tok)
+                continue
+            best = difflib.get_close_matches(tok, vocab, n=1, cutoff=0.87)
+            corrected_tokens.append(best[0] if best else tok)
+        normalized = " ".join(corrected_tokens)
         return normalized
+
+    def _quality_percentages(self, result: dict, retrieved_docs: list, quality: dict | None = None) -> dict:
+        out = dict(result or {})
+
+        q = quality or out.get("retrieval_quality")
+        if q:
+            overlap = float(q.get("best_overlap", 0.0))
+            semantic = max(0.0, float(q.get("best_semantic", 0.0)))
+            support_docs = int(q.get("supported_docs", 0))
+            denom = max(1, min(6, len(retrieved_docs or [])))
+            support_ratio = support_docs / denom
+            retrieval_pct = ((overlap * 0.45) + (semantic * 0.35) + (support_ratio * 0.20)) * 100.0
+        else:
+            retrieval_pct = max(0.0, min(float(out.get("confidence", 0.0)), 1.0)) * 100.0
+
+        grounding = float(out.get("grounding_score", 0.0) or 0.0)
+        citation = float(out.get("citation_coverage", 0.0) or 0.0)
+        alignment = float(out.get("alignment_score", 0.0) or 0.0)
+        confidence = max(0.0, min(float(out.get("confidence", 0.0) or 0.0), 1.0))
+        answer_txt = (out.get("answer") or "").strip().lower()
+        if "i don't have this information" in answer_txt:
+            generation_pct = (confidence * 0.65 + 0.35) * 100.0
+        else:
+            generation_pct = ((confidence * 0.45) + (grounding * 0.30) + (citation * 0.15) + (alignment * 0.10)) * 100.0
+
+        out["retrieval_quality_percentage"] = round(max(0.0, min(retrieval_pct, 100.0)), 2)
+        out["generation_quality_percentage"] = round(max(0.0, min(generation_pct, 100.0)), 2)
+        return out
 
     def _generate_query_variants(self, query: str) -> list:
         """Generate retrieval-only query variants for casual language and common typos."""
@@ -2106,6 +2183,8 @@ Answer:"""
     def answer(self, query: str) -> dict:
         """Generate answer using enhanced RAG pipeline"""
         print(f"🔍 Processing query: {query}")
+        self._last_retrieved_docs = []
+        self._last_retrieval_quality = None
 
         if hasattr(self.vectordb, "is_index_ready") and not self.vectordb.is_index_ready():
             result = {
@@ -2155,6 +2234,8 @@ Answer:"""
 
         intent = self._detect_query_intent(query)
         quality = self._retrieval_quality_report(query, retrieved_docs, intent=intent)
+        self._last_retrieved_docs = retrieved_docs
+        self._last_retrieval_quality = quality
         print(
             "🧪 Retrieval quality "
             f"passed={quality['passed']} overlap={quality['best_overlap']:.2f} "

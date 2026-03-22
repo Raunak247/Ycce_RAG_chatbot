@@ -1,269 +1,102 @@
-<<<<<<< HEAD
-# Ycce_RAG_chatbot
-=======
-# 📚 YCCE Multimodal RAG System - Project Documentation Index
+# YCCE Smart RAG Chatbot
 
-## 🗂️ Quick Navigation
+This project is a FAISS-backed Retrieval-Augmented Generation system that answers YCCE questions from indexed chunks stored in `index.faiss` and `index.pkl`.
 
-### Getting Started
-- **[EXECUTION_GUIDE.md](EXECUTION_GUIDE.md)** - How to run the system
-  - Quick start commands
-  - Pipeline monitoring
-  - Troubleshooting
-  
-- **[MULTIMODAL_RAG_STATUS.md](MULTIMODAL_RAG_STATUS.md)** - System overview
-  - Architecture details
-  - Technologies used
-  - Testing results
-  - Next steps for chatbot
+## What Is Implemented
 
-### Source Code
-- **`main_initial_crawl.py`** - Master pipeline orchestrator
-  - Lines 1-70: Configuration & imports
-  - Lines 75-110: STEP 1 (BFS Crawl)
-  - Lines 115-145: STEP 2 (Change Detection)
-  - Lines 150-260: STEP 3 (Multimodal Ingestion)
-  - Lines 265-276: Final summary
+The chatbot now uses a full, practical RAG pipeline instead of single-step similarity lookup.
 
-- **`vectordb/image_embeddings.py`** - CLIP image embedding (NEW)
-  - `ImageEmbedder` class (lines 15-106)
-  - `embed_image_from_url()` function (lines 118-130)
-  - Batch processing support
+1. Query understanding and correction
+2. Multi-variant retrieval against FAISS
+3. Hybrid reranking (lexical + semantic + source quality)
+4. Evidence augmentation (sentence-level extraction)
+5. Grounded answer generation with citations
+6. Validation and fallback (extractive, no hallucination)
+7. Response packaging with relevant links + evidence reasons
+8. Quality scoring in percentage for retrieval and generation
 
-- **`vectordb/vectordb_manager.py`** - Multimodal FAISS (EXTENDED)
-  - `upsert_image_embedding()` method (NEW)
-  - `persist()` method (NEW)
-  - All existing methods preserved
+## RAG Concepts Used
 
-### Testing & Validation
-- **`test_multimodal.py`** - Integration test
-  - Tests text + image ingestion
-  - Validates FAISS persistence
-  - Checks semantic search
-  
-- **`validate_system.py`** - Pre-deployment checker
-  - Verifies all components
-  - Checks import availability
-  - Confirms file structure
+The code in `chatbot/rag_engine.py` applies the following RAG concepts end-to-end:
 
----
+1. Chunk-based semantic retrieval from vector index (`index.faiss`)
+2. Metadata-grounded retrieval using docstore (`index.pkl`)
+3. Query rewriting and variant expansion for robust recall
+4. Typo/semantic correction (normalization + fuzzy token correction)
+5. Hybrid scoring (token overlap + embedding cosine similarity)
+6. Intent-aware source balancing (`html`, `pdf`, `xlsx`, `csv`)
+7. Low-signal/noise chunk suppression
+8. Source deduplication and source diversity constraints
+9. Sentence-level evidence mining and context compression
+10. Citation-constrained generation (`[S1]`, `[S2]`, ...)
+11. Grounding checks (answer-evidence overlap)
+12. Citation coverage checks
+13. Query-answer alignment checks
+14. Deterministic fallback extraction when generation is weak
+15. Confidence scoring + quality percentages
 
-## 🎯 System Architecture at a Glance
+## Accuracy and Speed Strategy
 
-```
-WEB CRAWL → DISCOVER URLS (27,890)
-    ↓
-CHANGE DETECTION → IDENTIFY MODIFIED CONTENT
-    ↓
-MULTIMODAL INGESTION
-    ├─ TEXT STREAM
-    │  └─ PDF/HTML/Excel
-    │     └─ LangChain Loaders
-    │        └─ Text Splitter (chunks)
-    │           └─ Sentence-Transformers (embed)
-    │              └─ FAISS (store)
-    │
-    └─ IMAGE STREAM
-       └─ JPEG/PNG/WebP URLs
-          └─ CLIP Model (embed)
-             └─ FAISS (store)
-    
-    UNIFIED FAISS INDEX (text + images)
-         ↓
-    SEMANTIC SEARCH
-         ↓
-    CHATBOT / API RESULTS
-```
+No RAG system can guarantee absolute accuracy on all queries. This implementation is designed to maximize practical accuracy and robustness by:
 
----
+1. Preferring authoritative chunks for role/factual questions
+2. Rejecting weak evidence with safe response fallback
+3. Returning evidence and links so answers are inspectable
+4. Avoiding unsupported claims when context is missing
+5. Using fast deterministic paths for some factual intents
 
-## 📊 Implementation Status
+## Quality Percentages (New Output)
 
-| Component | Status | Lines | Notes |
-|-----------|--------|-------|-------|
-| **Pipeline** | ✅ Ready | 277 | All 3 steps integrated |
-| **CLIP Module** | ✅ Ready | 146 | In-memory, no disk bloat |
-| **FAISS Manager** | ✅ Ready | 137 | Multimodal extension |
-| **Testing** | ✅ Passed | - | Text + image verified |
-| **Documentation** | ✅ Complete | - | 3 guides + this index |
-| **Backward Compat** | ✅ Verified | - | Existing code untouched |
+Every answer now includes:
 
----
+1. `retrieval_quality_percentage`
+2. `generation_quality_percentage`
 
-## 🚀 Quick Start Commands
+These are computed from retrieval support, semantic relevance, grounding, citation coverage, alignment, and confidence.
 
-```bash
-# Full production run (complete ingestion)
-python main_initial_crawl.py
+## API/Result Fields
 
-# Test multimodal features (quick)
-python test_multimodal.py
+A typical answer dictionary now contains:
 
-# Pre-deployment validation
-python validate_system.py
+1. `answer`
+2. `sources`
+3. `confidence`
+4. `docs_count`
+5. `avg_score`
+6. `retrieval_quality` (when available)
+7. `grounding_score` (path-dependent)
+8. `citation_coverage` (path-dependent)
+9. `alignment_score` (path-dependent)
+10. `retrieval_quality_percentage`
+11. `generation_quality_percentage`
 
-# Resume interrupted pipeline
-python main_initial_crawl.py
-# (automatically detects completed steps from pipeline_progress.json)
+## Data Dependencies
+
+The chatbot answers from persisted vector artifacts:
+
+1. `data/faiss_index/index.faiss`
+2. `data/faiss_index/index.pkl`
+
+If these are missing, stale, or noisy, answer quality will degrade.
+
+## Run and Test
+
+From the project root (`YCCE_Chatbot`):
+
+```powershell
+d:/ycce_chatbot/.venv/Scripts/python.exe -m py_compile chatbot/rag_engine.py
 ```
 
----
+Quick smoke test:
 
-## 📈 Performance Expectations
-
-| Task | Time | Scale |
-|------|------|-------|
-| BFS Crawl | 5-10 min | 27,890 URLs |
-| Change Detection | 1-2 min | Registry check |
-| Text Ingestion | 90-120 min | 25,000 PDFs/HTML |
-| Image Ingestion | 3-5 min | 150 images |
-| **Total** | **~2 hours** | **27,890 items** |
-
-**Output size:** ~500 MB FAISS index
-
----
-
-## 🔑 Key Technologies
-
-| Tech | Purpose | Version |
-|------|---------|---------|
-| LangChain | Document loading & processing | 0.2+ |
-| Sentence-Transformers | Text embeddings (384-dim) | Latest |
-| OpenAI CLIP | Image embeddings (768-dim) | ViT-B/32 |
-| FAISS | Vector search index | CPU |
-| Requests | HTTP client | Latest |
-| BeautifulSoup4 | HTML parsing | 4.x |
-| PyPDF | PDF parsing | Latest |
-
----
-
-## 📁 Data Files Generated
-
-```
-data/
-├── discovered_urls.json         (27,890 URLs from crawl)
-├── url_registry.json            (registry for change detection)
-├── pipeline_progress.json       (execution state - allows resume)
-├── ingested_urls.json           (tracking for deduplication)
-├── media_registry.json          (image URLs for chatbot)
-└── faiss_index/                 (multimodal vector store)
-    ├── index.faiss              (FAISS index - ~500 MB)
-    ├── index.pkl                (metadata)
-    └── docstore.pkl             (documents cache)
+```powershell
+d:/ycce_chatbot/.venv/Scripts/python.exe -c "from chatbot.rag_engine import SmartRAG; r=SmartRAG(); print(r.answer('where is ycce located'))"
 ```
 
----
+## Notes for Evaluation
 
-## 🔧 Configuration Reference
+1. Test with real user typos and shorthand (for example `calender`, `admisson`, `departmant`, `semster`).
+2. Compare answers with official YCCE sources and evidence blocks.
+3. Track percentage trends over multiple test prompts.
 
-### Image Processing
-- **Timeout per image:** 15 seconds
-- **Max retries:** 2 attempts
-- **Batch size:** Configurable (default 32)
-
-### FAISS Index
-- **Text embedding dim:** 384 (Sentence-Transformers)
-- **Image embedding dim:** 768 (CLIP)
-- **Index type:** FAISS CPU (no GPU required)
-
-### Pipeline State
-- **Progress file:** `data/pipeline_progress.json`
-- **Auto-resume:** Yes (detects completed steps)
-- **Manual reset:** Delete `pipeline_progress.json`
-
----
-
-## ⚠️ Limitations & Considerations
-
-1. **Memory:** Requires ~2GB RAM for full pipeline
-2. **Network:** Images require internet access (timeout: 15s)
-3. **Time:** Full pipeline ~2 hours for 27k URLs
-4. **Disk:** FAISS index ~500MB (vs. local image storage would be GBs)
-5. **GPU:** Optional (accelerates CLIP 10x if available)
-
----
-
-## 🎯 Next Steps for Development
-
-### Immediate (Post-Deployment)
-1. ✅ Run full pipeline on 27k URLs
-2. ✅ Verify FAISS creation
-3. ✅ Test semantic search quality
-4. ✅ Deploy to chatbot/API
-
-### Short-term (Week 1-2)
-- [ ] Integrate with Streamlit chatbot
-- [ ] Enable image downloads from media_registry
-- [ ] Performance optimization for common queries
-- [ ] User feedback collection
-
-### Medium-term (Month 2-3)
-- [ ] Implement batch parallel processing (ThreadPoolExecutor)
-- [ ] Add GPU support (CUDA for CLIP)
-- [ ] Scale to 50k+ URLs (FAISS sharding)
-- [ ] Add re-indexing capability
-
----
-
-## 📞 Support & Debugging
-
-### Common Issues
-
-**"FAISS index not found"**
-- Normal on first run, created during STEP 3
-
-**"Out of memory"**
-- Reduce batch_size or run on machine with more RAM
-
-**"Image timeout errors"**
-- Normal if YCCE server slow, pipeline continues
-
-**"PDF parsing errors"**
-- Non-critical, valid PDFs are parsed
-
-### Logs & Monitoring
-- Real-time: `data/pipeline_progress.json`
-- Detailed: Terminal output during execution
-- Performance: Check `data/ingested_urls.json` for statistics
-
----
-
-## ✨ Success Metrics
-
-After deployment, verify:
-- ✅ FAISS index created with 50k+ vectors
-- ✅ 150+ images embedded in index
-- ✅ Semantic search returns relevant results (score > 0.7)
-- ✅ Media registry contains downloadable image URLs
-- ✅ Pipeline completes in ~2 hours
-- ✅ Zero data loss / resumeable state
-
----
-
-## 📄 Documentation Files
-
-- **MULTIMODAL_RAG_STATUS.md** - System architecture & implementation details
-- **EXECUTION_GUIDE.md** - How to run, monitor, and troubleshoot
-- **README.md (this file)** - Navigation & quick reference
-
----
-
-## 🏆 Project Completion Summary
-
-**Status: ✅ PRODUCTION READY**
-
-- Full 3-step pipeline operational
-- CLIP image embedding integrated
-- FAISS multimodal index ready
-- Backward compatibility verified
-- Comprehensive documentation complete
-- System ready for 27.9k URL ingestion
-- Chatbot integration pathway clear
-
-**Next Action:** Run `python main_initial_crawl.py` to begin production ingestion.
-
----
-
-*Last Updated: 2025-01-23*  
-*Developed for: YCCE (YeshwantRao Chavan College of Engineering)*
->>>>>>> b1a2073 (Initial pushing codes of chatbot)
+If you need stricter production behavior, set policy to return unknown whenever grounding or alignment drops below threshold.
