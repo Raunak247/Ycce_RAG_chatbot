@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual Environment
+venv/
+.env
+
+# Vector DB / FAISS / Chroma
+data/faiss_index/
+vectordb/chroma_db/
+*.faiss
+*.pkl
+*.sqlite3
+
+# Logs
+*.log
+
+# VS Code
+.vscode/
