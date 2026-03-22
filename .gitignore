@@ -1,7 +1,6 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 
 # Virtual Environment
 venv/
@@ -9,18 +8,15 @@ venv/
 
 # Vector DB / FAISS / Chroma
 data/faiss_index/
+data/faiss_index_backup_*/
 vectordb/chroma_db/
 *.faiss
 *.pkl
 *.sqlite3
 
-# Runtime pipeline artifacts (generated)
+# Pipeline artifacts
 data/input/
-data/media_registry.json
-data/discovered_urls.json
-data/url_registry.json
-data/ingested_urls.json
-data/pipeline_progress.json
+data/*.json
 
 # Logs
 *.log

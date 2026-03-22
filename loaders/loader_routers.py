@@ -17,11 +17,45 @@ from langchain_community.document_loaders import (
 )
 from langchain_core.documents import Document
 
+
+def _fallback_pdf_text(tmp_path, source_url):
+    """Best-effort PDF extraction when PyPDFLoader fails on font encodings."""
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+
+    docs = []
+    try:
+        reader = PdfReader(tmp_path, strict=False)
+        for i, page in enumerate(reader.pages):
+            try:
+                text = (page.extract_text() or "").strip()
+            except Exception:
+                # Skip problematic pages but keep extracting others.
+                continue
+
+            if text:
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "source_url": source_url,
+                            "page": i,
+                        },
+                    )
+                )
+    except Exception:
+        return []
+
+    return docs
+
 def _is_local_path(source):
     return isinstance(source, str) and os.path.exists(source)
 
 
 def load_html(source):
+    import re as _re
     if _is_local_path(source):
         with open(source, "r", encoding="utf-8", errors="ignore") as f:
             html = f.read()
@@ -33,7 +67,35 @@ def load_html(source):
         source_url = source
 
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ")
+
+    # Remove boilerplate noise: navigation menus, scripts, footers, sidebars
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside",
+                     "noscript", "iframe", "form", "button"]):
+        tag.decompose()
+
+    # Also remove elements commonly used for menus/sidebars by class/id
+    for tag in soup.find_all(True, {"class": lambda c: c and any(
+            k in " ".join(c).lower() for k in ["nav", "menu", "sidebar", "breadcrumb", "widget", "banner"])}):
+        tag.decompose()
+
+    # Try to extract content from the most-meaningful element first
+    main_content = (
+        soup.find("main")
+        or soup.find("article")
+        or soup.find(id="main-content")
+        or soup.find(id="main")
+        or soup.find(id="content")
+        or soup.find(class_="entry-content")
+        or soup.find(class_="page-content")
+        or soup.find(class_="content-area")
+        or soup.find(class_="post-content")
+        or soup.body
+        or soup
+    )
+
+    text = main_content.get_text(separator="\n", strip=True)
+    # Collapse excessive blank lines into at most two
+    text = _re.sub(r"\n{3,}", "\n\n", text).strip()
 
     return [Document(page_content=text, metadata={"source_url": source_url})]
 
@@ -91,7 +153,16 @@ def load_pdf(source):
         raise
 
     loader = PyPDFLoader(tmp_name)
-    return loader.load()
+    try:
+        return loader.load()
+    except Exception as e:
+        # Some PDFs fail in pypdf due to unsupported encodings like /SymbolSetEncoding.
+        # Fall back to per-page best-effort extraction so ingestion can continue.
+        print(f"[WARN] Primary PDF parser failed ({e}); trying fallback parser")
+        docs = _fallback_pdf_text(tmp_name, source if not _is_local_path(source) else source)
+        if docs:
+            return docs
+        raise
 
 
 def load_xlsx(source):

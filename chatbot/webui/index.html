@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YCCE Smart Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">YC</div>
+          <div class="brand-copy">
+            <h1>YCCE Smart Chat</h1>
+            <p>RAG Assistant</p>
+          </div>
+        </div>
+
+        <button id="new-chat" class="new-chat-btn" type="button">+ New Chat</button>
+
+        <div class="sidebar-section">
+          <h2>Guidelines</h2>
+          <ul>
+            <li>Ask short and clear questions.</li>
+            <li>Use follow-up questions naturally.</li>
+            <li>Responses are grounded in your indexed data.</li>
+          </ul>
+        </div>
+      </aside>
+
+      <main class="chat-layout">
+        <header class="topbar">
+          <div>
+            <h2>Ask anything about YCCE</h2>
+            <p>Admission, academics, departments, and campus info</p>
+          </div>
+          <span class="status-pill" id="status-pill">Ready</span>
+        </header>
+
+        <section id="chat-window" class="chat-window" aria-live="polite"></section>
+
+        <footer class="composer-wrap">
+          <form id="composer-form" class="composer" autocomplete="off">
+            <textarea
+              id="composer-input"
+              rows="1"
+              placeholder="Message YCCE Smart Chat"
+              aria-label="Message input"
+            ></textarea>
+            <button id="send-btn" type="submit">Send</button>
+          </form>
+          <p class="hint">Enter to send, Shift+Enter for new line.</p>
+        </footer>
+      </main>
+    </div>
+
+    <template id="message-template">
+      <article class="message">
+        <div class="avatar"></div>
+        <div class="bubble-wrap">
+          <div class="meta"></div>
+          <div class="bubble"></div>
+        </div>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

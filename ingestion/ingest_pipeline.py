@@ -1,8 +1,12 @@
+import sys
 import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import json
 import hashlib
 import shutil
 from datetime import datetime
+from typing import Tuple, Set
 
 from loaders.loader_routers import route_loader
 from vectordb.faiss_stores import upsert_documents
@@ -12,7 +16,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 INGEST_TRACK_FILE = "data/ingested_urls.json"
 BATCH_SIZE = 50  # Upsert every N documents to avoid memory buildup
 MIN_DISK_MB = 500  # Require at least 500 MB free
-SINGLE_FOLDER_PER_RUN = True  # Stop after one full folder so FAISS can be tested safely
+SINGLE_FOLDER_PER_RUN = os.getenv("SINGLE_FOLDER_PER_RUN", "0") == "1"  # Set 1 to pause after each folder
+FOLDER_ORDER = ["xlsx", "html", "pdf", "image"]  # Process html before pdf so web content is searchable
+HTML_REINGEST_CANDIDATES_FILE = "data/html_reingest_candidates.json"
+ACTIVE_PENDING_STATUSES = {"parsed", "failed", "needs_reingest"}
 
 
 # -------------------------------------------------
@@ -51,6 +58,17 @@ def get_ingested_urls_set(ingested_list):
     return ingested_urls
 
 
+def get_ingested_local_paths_set(ingested_list):
+    """Return a set of local_path values for successfully ingested items."""
+    paths = set()
+    for item in ingested_list:
+        if isinstance(item, dict) and item.get("status") == "ingested":
+            lp = item.get("local_path")
+            if lp:
+                paths.add(os.path.abspath(lp).lower())
+    return paths
+
+
 def get_completed_folders(ingested_list):
     """Return folders explicitly marked complete."""
     completed = set()
@@ -62,14 +80,58 @@ def get_completed_folders(ingested_list):
 
 def get_last_processed_folder(ingested_list):
     """Determine next folder to process based on explicit completion markers."""
-    folder_order = ["xlsx", "html", "pdf", "image"]
     processed_folders = get_completed_folders(ingested_list)
 
-    for folder in folder_order:
+    for folder in FOLDER_ORDER:
         if folder not in processed_folders:
             return folder
 
     return None  # All done
+
+
+def _get_latest_item_statuses(ingested_list):
+    """Return latest status per item key (url/local_path) based on append order."""
+    latest = {}
+
+    for item in ingested_list:
+        if not isinstance(item, dict):
+            continue
+
+        status = item.get("status")
+        if status == "folder_complete":
+            continue
+
+        folder = item.get("folder", "unknown")
+        local_path = (item.get("local_path") or "").strip()
+        url = (item.get("url") or "").strip()
+
+        if local_path:
+            key = f"local_path::{os.path.abspath(local_path).lower()}"
+        elif url:
+            key = f"url::{url}"
+        else:
+            continue
+
+        latest[key] = {
+            "folder": folder,
+            "status": status,
+        }
+
+    return latest
+
+
+def has_pending_ingestion_items(ingested_list):
+    """True when latest item statuses still include active pending work."""
+    latest = _get_latest_item_statuses(ingested_list)
+    for value in latest.values():
+        if value.get("folder") in FOLDER_ORDER and value.get("status") in ACTIVE_PENDING_STATUSES:
+            return True
+    return False
+
+
+def is_ingestion_complete(ingested_list):
+    """Strict completion: all folder markers done and no active pending item statuses."""
+    return get_last_processed_folder(ingested_list) is None and not has_pending_ingestion_items(ingested_list)
 
 
 def mark_folder_complete(ingested_list, folder):
@@ -121,6 +183,34 @@ def batch_upsert(chunks, batch_size=BATCH_SIZE):
                 raise
 
 
+def _load_priority_html_reingest_sets() -> Tuple[Set[str], Set[str]]:
+    """Load HTML files/URLs that must be re-ingested first due index.pkl mismatch."""
+    priority_urls: Set[str] = set()
+    priority_local_paths: Set[str] = set()
+
+    if not os.path.exists(HTML_REINGEST_CANDIDATES_FILE):
+        return priority_urls, priority_local_paths
+
+    try:
+        with open(HTML_REINGEST_CANDIDATES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for item in data.get("missing_but_marked_ingested", []):
+            if not isinstance(item, dict):
+                continue
+
+            mapped_url = (item.get("mapped_url") or "").strip()
+            local_path = (item.get("local_path") or "").strip()
+            if mapped_url:
+                priority_urls.add(mapped_url)
+            if local_path:
+                priority_local_paths.add(os.path.abspath(local_path).lower())
+    except Exception as e:
+        print(f"[WARN] Could not load priority HTML reingest candidates: {e}")
+
+    return priority_urls, priority_local_paths
+
+
 # -------------------------------------------------
 # FOLDER-ORDERED INGESTION
 # -------------------------------------------------
@@ -146,10 +236,53 @@ def ingest_items_ordered(items_by_folder):
     # Load existing progress
     ingested_list = load_ingested_urls()
     ingested_urls = get_ingested_urls_set(ingested_list)
+    ingested_local_paths = get_ingested_local_paths_set(ingested_list)
     
-    # Determine resume point
+    # Determine resume point from checkpoint markers.
     resume_folder = get_last_processed_folder(ingested_list)
-    folder_order = ["xlsx", "html", "pdf", "image"]
+    folder_order = list(FOLDER_ORDER)
+
+    # If checkpoint points to a later folder but earlier folders still have pending items,
+    # prefer the earliest pending folder to avoid false "paused at image" behavior.
+    first_pending_folder = None
+    for candidate_folder in folder_order:
+        candidate_items = items_by_folder.get(candidate_folder, []) or []
+        if not candidate_items:
+            continue
+
+        has_pending = False
+        for candidate_item in candidate_items:
+            if not isinstance(candidate_item, dict):
+                has_pending = True
+                break
+
+            candidate_url = (candidate_item.get("url") or "").strip()
+            candidate_lp = (candidate_item.get("local_path") or "").strip()
+            candidate_lp_norm = os.path.abspath(candidate_lp).lower() if candidate_lp else ""
+
+            if candidate_url and candidate_url in ingested_urls:
+                continue
+            if candidate_lp_norm and candidate_lp_norm in ingested_local_paths:
+                continue
+
+            has_pending = True
+            break
+
+        if has_pending:
+            first_pending_folder = candidate_folder
+            break
+
+    if first_pending_folder:
+        if (
+            resume_folder is None
+            or folder_order.index(first_pending_folder) < folder_order.index(resume_folder)
+        ):
+            if resume_folder:
+                print(
+                    f"[RESUME-OVERRIDE] Checkpoint suggested '{resume_folder}', "
+                    f"but pending items exist in earlier folder '{first_pending_folder}'."
+                )
+            resume_folder = first_pending_folder
     
     if resume_folder:
         print(f"[RESUME] Starting/resuming from folder: {resume_folder}")
@@ -170,6 +303,10 @@ def ingest_items_ordered(items_by_folder):
         items = items_by_folder.get(folder, [])
         if not items:
             print(f"[SKIP] No items in folder '{folder}'")
+            # Mark empty folder as complete so resume pointer can move forward.
+            if not disk_full:
+                mark_folder_complete(ingested_list, folder)
+                save_ingested_urls(ingested_list)
             continue
         
         print(f"\n{'='*60}")
@@ -185,10 +322,17 @@ def ingest_items_ordered(items_by_folder):
             file_type = item["type"]
             local_path = item.get("local_path") if isinstance(item, dict) else None
             load_source = local_path if local_path else url
+            is_priority_reingest = bool(isinstance(item, dict) and item.get("priority_reingest"))
             
             # ✅ SKIP IF ALREADY INGESTED
             if url in ingested_urls:
                 print(f"  [SKIP] {idx+1}/{len(items)}: Already ingested - {url[:80]}")
+                folder_skipped += 1
+                total_skipped += 1
+                continue
+            # Also skip if local file was already ingested (even if URL differs)
+            if local_path and os.path.abspath(local_path).lower() in ingested_local_paths:
+                print(f"  [SKIP] {idx+1}/{len(items)}: Local file already ingested - {os.path.basename(local_path)}")
                 folder_skipped += 1
                 total_skipped += 1
                 continue
@@ -202,7 +346,10 @@ def ingest_items_ordered(items_by_folder):
                     disk_full = True
                     break
                 
-                print(f"  [INGEST] {idx+1}/{len(items)}: {url[:70]}")
+                if folder == "html" and is_priority_reingest:
+                    print(f"  [INGEST-PRIORITY-HTML] {idx+1}/{len(items)}: {url[:70]}")
+                else:
+                    print(f"  [INGEST] {idx+1}/{len(items)}: {url[:70]}")
                 docs = route_loader(load_source, file_type)
                 
                 if not docs:
@@ -250,8 +397,12 @@ def ingest_items_ordered(items_by_folder):
 
                 record["status"] = "ingested"
                 record["timestamp"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                if local_path:
+                    record["local_path"] = os.path.abspath(local_path)
                 save_ingested_urls(ingested_list)
                 ingested_urls.add(url)
+                if local_path:
+                    ingested_local_paths.add(os.path.abspath(local_path).lower())
                 folder_new += 1
                 total_new += 1
             
@@ -286,14 +437,19 @@ def ingest_items_ordered(items_by_folder):
     print(f"  Total failed: {total_failed}")
     print(f"{'='*60}")
     
-    # Check if all folders done
+    # Check if all folders done (strict): markers complete + no pending statuses.
     resume_folder = get_last_processed_folder(ingested_list)
-    if resume_folder is None:
+    pending_items_left = has_pending_ingestion_items(ingested_list)
+    if resume_folder is None and not pending_items_left:
         print("\n[SUCCESS] ingestion into faiss.index finally done")
         print("\n[SUCCESS] Your FAISS index is ready for the chatbot!")
         print(f"   Path: data/faiss_index/")
         print(f"   Total URLs ingested: {len(ingested_urls)}")
         return True
+    elif resume_folder is None and pending_items_left:
+        print("\n[PAUSE] Folder markers are complete, but pending parsed/failed items still exist")
+        print("   Re-run the command to continue processing pending items")
+        return False
     else:
         print(f"\n[PAUSE] Ingestion paused at folder '{resume_folder}'")
         print(f"   Re-run the command to resume from this folder")
@@ -309,6 +465,11 @@ def ingest_items(items):
     Supports both dict-style items (new format) and legacy formats.
     """
     print("\n[WRAPPER] Organizing items by folder...")
+    
+    # Load already-ingested tracking FIRST
+    ingested_list = load_ingested_urls()
+    ingested_urls = get_ingested_urls_set(ingested_list)
+    ingested_local_paths = get_ingested_local_paths_set(ingested_list)
     
     # Organize by folder
     items_by_folder = {
@@ -334,7 +495,145 @@ def ingest_items(items):
             folder = file_type  # fallback
         
         items_by_folder[folder].append(item)
-    
+
+    # Load priority reingest sets once (used for both queue enrichment and ordering).
+    priority_urls, priority_local_paths = _load_priority_html_reingest_sets()
+
+    # NOTE: Do NOT force-add local PDFs from data/input/pdf
+    # discovered_urls.json is the source of truth for what SHOULD be ingested.
+    # Local files in data/input/pdf are the download cache, not source of truth.
+    # Only PDFs from discovered_urls will be ingested via checkpoint system.
+
+    # Prefer existing local HTML cache for current HTML items, but do NOT append the full html cache.
+    # Appending every file from data/input/html can inflate queue size with stale entries.
+    html_root = os.path.join("data", "input", "html")
+    existing_html_local_paths = set()
+    for item in items_by_folder["html"]:
+        if isinstance(item, dict) and item.get("local_path"):
+            existing_html_local_paths.add(os.path.abspath(item["local_path"]).lower())
+
+    def _canonical_url_no_fragment(url: str) -> str:
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url or "")
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
+
+    def _local_html_path_for_url(url: str) -> str:
+        canonical = _canonical_url_no_fragment(url)
+        from urllib.parse import urlparse
+        base_name = os.path.basename(urlparse(canonical).path) or "index"
+        base_name = "".join(ch for ch in base_name if ch.isalnum() or ch in ("-", "_", ".")) or "file"
+        url_hash = hashlib.md5(canonical.encode("utf-8")).hexdigest()[:10]
+        return os.path.abspath(os.path.join(html_root, f"{base_name}_{url_hash}.html"))
+
+    linked_cached_html_count = 0
+    for item in items_by_folder["html"]:
+        if not isinstance(item, dict):
+            continue
+        if item.get("local_path"):
+            continue
+        url = (item.get("url") or "").strip()
+        if not url:
+            continue
+        expected_path = _local_html_path_for_url(url)
+        if os.path.exists(expected_path):
+            item["local_path"] = expected_path
+            existing_html_local_paths.add(expected_path.lower())
+            linked_cached_html_count += 1
+
+    if linked_cached_html_count:
+        print(f"  [html-cache] Linked {linked_cached_html_count} HTML URLs to existing local cache")
+
+    # Add only priority local HTML files missing from the current queue.
+    added_priority_local_html_count = 0
+    if priority_local_paths:
+        represented_local_paths = set()
+        for item in items_by_folder["html"]:
+            if not isinstance(item, dict):
+                continue
+            lp = (item.get("local_path") or "").strip()
+            if lp:
+                represented_local_paths.add(os.path.abspath(lp).lower())
+
+        for lp in sorted(priority_local_paths):
+            abs_lp = os.path.abspath(lp)
+            lp_norm = abs_lp.lower()
+            if not os.path.exists(abs_lp):
+                continue
+            if lp_norm in represented_local_paths:
+                continue
+
+            items_by_folder["html"].append(
+                {
+                    "url": f"local://html/{os.path.basename(abs_lp)}",
+                    "type": "html",
+                    "local_path": abs_lp,
+                    "priority_reingest": True,
+                }
+            )
+            represented_local_paths.add(lp_norm)
+            added_priority_local_html_count += 1
+
+    if added_priority_local_html_count:
+        print(f"  [html-priority] +{added_priority_local_html_count} priority local HTML files added")
+
+    # De-duplicate HTML queue by local_path first, then URL (for URL-only entries).
+    deduped_html_items = []
+    seen_html_local_paths = set()
+    seen_html_urls = set()
+    removed_html_dupes = 0
+    for item in items_by_folder["html"]:
+        if not isinstance(item, dict):
+            deduped_html_items.append(item)
+            continue
+
+        url = (item.get("url") or "").strip()
+        lp = (item.get("local_path") or "").strip()
+        lp_norm = os.path.abspath(lp).lower() if lp else ""
+
+        if lp_norm:
+            if lp_norm in seen_html_local_paths:
+                removed_html_dupes += 1
+                continue
+            seen_html_local_paths.add(lp_norm)
+        elif url:
+            if url in seen_html_urls:
+                removed_html_dupes += 1
+                continue
+            seen_html_urls.add(url)
+
+        deduped_html_items.append(item)
+
+    items_by_folder["html"] = deduped_html_items
+    if removed_html_dupes:
+        print(f"  [html-dedupe] Removed {removed_html_dupes} duplicate HTML queue entries")
+
+    # Priority-first HTML queue: ingest known index.pkl-missing HTML items before the normal HTML queue.
+    # This preserves old logic and ordering for all non-priority items.
+    if items_by_folder["html"] and (priority_urls or priority_local_paths):
+        priority_html_items = []
+        regular_html_items = []
+
+        for item in items_by_folder["html"]:
+            if not isinstance(item, dict):
+                regular_html_items.append(item)
+                continue
+
+            url = (item.get("url") or "").strip()
+            lp = (item.get("local_path") or "").strip()
+            lp_norm = os.path.abspath(lp).lower() if lp else ""
+
+            if url in priority_urls or (lp_norm and lp_norm in priority_local_paths):
+                tagged = dict(item)
+                tagged["priority_reingest"] = True
+                priority_html_items.append(tagged)
+            else:
+                regular_html_items.append(item)
+
+        items_by_folder["html"] = priority_html_items + regular_html_items
+        if priority_html_items:
+            print(f"  [html-priority] {len(priority_html_items)} index.pkl-missing HTML items will be ingested first")
+            print(f"  [html-normal] {len(regular_html_items)} remaining HTML items will follow old ingestion flow")
+
     # Print breakdown
     for folder, items_list in items_by_folder.items():
         if items_list:

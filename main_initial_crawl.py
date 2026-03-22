@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import json
+import re
 import requests
 from urllib.parse import urlparse
 
@@ -51,7 +52,7 @@ if sys.platform == "win32":
 
 from crawler.bfs_crawler import bfs_crawl
 from detector.change_detector import detect_changes
-from ingestion.ingest_pipeline import ingest_items, get_last_processed_folder, load_ingested_urls
+from ingestion.ingest_pipeline import ingest_items, get_last_processed_folder, load_ingested_urls, is_ingestion_complete
 from ingestion.runtime_input_cache import prepare_runtime_input_cache
 from vectordb.vectordb_manager import VectorDBManager
 from config import BASE_URL
@@ -81,10 +82,10 @@ def load_progress():
             "ingestion_done": False
         }
 
-    # Derive ingestion completion from explicit folder completion markers.
+    # Derive ingestion completion from strict state (folder markers + no pending statuses).
     try:
-        remaining_folder = get_last_processed_folder(load_ingested_urls())
-        progress["ingestion_done"] = remaining_folder is None
+        ingested_state = load_ingested_urls()
+        progress["ingestion_done"] = is_ingestion_complete(ingested_state)
     except Exception:
         progress.setdefault("ingestion_done", False)
 
@@ -106,6 +107,61 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 def is_image(url: str) -> bool:
     """Check if URL points to an image file (no download)."""
     return url.lower().endswith(IMAGE_EXTENSIONS)
+
+
+def _humanize_token(token: str) -> str:
+    token = (token or "").replace("_", " ").replace("-", " ").strip()
+    token = re.sub(r"\s+", " ", token)
+    return token
+
+
+def _infer_image_description(title: str, url: str) -> str:
+    lower = f"{title} {url}".lower()
+    if "pool" in lower or "swim" in lower:
+        return "Campus swimming pool side view"
+    if "classroom" in lower:
+        return "Campus classroom interior"
+    if "gallery" in lower:
+        return "Campus gallery image"
+    if "lab" in lower:
+        return "Campus laboratory image"
+    if "hostel" in lower:
+        return "Campus hostel image"
+    if "library" in lower:
+        return "Campus library image"
+    return f"Campus image: {title}" if title else "Campus image"
+
+
+def _build_image_metadata(img_url: str, local_path: str = None) -> dict:
+    parsed = urlparse(img_url or "")
+    file_name = os.path.basename(parsed.path or "")
+    stem, ext = os.path.splitext(file_name)
+    clean_title = _humanize_token(stem) or "Image"
+
+    tags = []
+    lower_name = clean_title.lower()
+    for token in ["pool", "classroom", "gallery", "lab", "hostel", "library", "campus"]:
+        if token in lower_name and token not in tags:
+            tags.append(token)
+    if "campus" not in tags:
+        tags.append("campus")
+
+    description = _infer_image_description(clean_title, img_url)
+    search_text = f"image {clean_title} {description} {' '.join(tags)} {img_url}".strip()
+
+    metadata = {
+        "source_url": img_url,
+        "content_type": "image",
+        "title": clean_title,
+        "description": description,
+        "tags": tags,
+        "search_text": search_text,
+        "file_name": file_name,
+        "file_ext": ext.lower().lstrip("."),
+    }
+    if local_path:
+        metadata["local_path"] = local_path
+    return metadata
 
 
 # ==================================================
@@ -194,9 +250,13 @@ def main():
             return
 
         try:
-            next_folder = get_last_processed_folder(load_ingested_urls())
+            current_ingestion_state = load_ingested_urls()
+            next_folder = get_last_processed_folder(current_ingestion_state)
             if next_folder is None:
-                print("[INFO] All folders are already marked complete")
+                if progress.get("ingestion_done"):
+                    print("[INFO] All folders are already marked complete")
+                else:
+                    print("[INFO] Folder markers are complete but pending items still exist")
             else:
                 print(f"[INFO] Next ingestion folder: {next_folder}")
         except Exception as e:
@@ -313,12 +373,7 @@ def main():
                             
                             if embedding:
                                 # Upsert to FAISS with metadata
-                                metadata = {
-                                    "source_url": img_url,
-                                    "content_type": "image"
-                                }
-                                if local_path:
-                                    metadata["local_path"] = local_path
+                                metadata = _build_image_metadata(img_url, local_path=local_path)
                                 db.upsert_image_embedding(embedding, metadata)
                                 media_records.append(metadata)
                                 embedded_count += 1
